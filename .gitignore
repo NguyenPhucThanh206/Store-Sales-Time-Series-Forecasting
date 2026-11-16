@@ -1,0 +1,51 @@
+# ==========================================
+# 1. DỮ LIỆU & KẾT QUẢ DỰ BÁO (LƯU TRÊN GOOGLE DRIVE)
+# Quy tắc dự án: Tuyệt đối không push .csv, .parquet, .npy lên GitHub
+# ==========================================
+*.csv
+*.parquet
+*.feather
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.joblib
+
+# Trọng số & Checkpoint mô hình (LightGBM, CatBoost, XGBoost, PyTorch GRU)
+*.pt
+*.pth
+*.ckpt
+*.cbm
+*.model
+*.txt.model
+catboost_info/
+
+# ==========================================
+# 2. PYTHON & MÔI TRƯỜNG ẢO (VIRTUAL ENV)
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+.venv/
+env/
+ENV/
+.ipynb_checkpoints/
+
+# ==========================================
+# 3. IDE, OS & CẤU HÌNH CÁ NHÂN (KAGGLE API)
+# ==========================================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+kaggle.json
+.env
+
+# ==========================================
+# 4. NGOẠI LỆ (GIỮ LẠI CẤU TRÚC THƯ MỤC RỖNG)
+# ==========================================
+!.gitkeep

@@ -73,6 +73,12 @@ def _store_to_cluster(stores_df: pd.DataFrame) -> Dict[int, int]:
 _DYNAMIC_COLS_CANDIDATES = [
     "log_sales",        # biến mục tiêu (đã log1p)
     "onpromotion",      # số sản phẩm khuyến mãi
+    "sin_dow",          # chu kỳ ngày trong tuần (sin)
+    "cos_dow",          # chu kỳ ngày trong tuần (cos)
+    "sin_month",        # chu kỳ tháng trong năm (sin)
+    "cos_month",        # chu kỳ tháng trong năm (cos)
+    "sin_day",          # chu kỳ ngày trong tháng (sin)
+    "cos_day",          # chu kỳ ngày trong tháng (cos)
     "dayofweek",        # 0=Mon … 6=Sun
     "day",              # ngày trong tháng
     "month",            # tháng
@@ -84,6 +90,28 @@ _DYNAMIC_COLS_CANDIDATES = [
     "oil_ma14",         # trung bình trượt giá dầu 14 ngày
     "transactions",     # số giao dịch (nếu có)
 ]
+
+
+def _add_cyclic_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Tạo các đặc trưng chu kỳ thời gian (sin/cos) cho mạng GRU."""
+    df = df.copy()
+    if "date" in df.columns:
+        dt = pd.to_datetime(df["date"])
+        dow   = dt.dt.dayofweek
+        day   = dt.dt.day
+        month = dt.dt.month
+
+        df["dayofweek"] = dow.astype(np.float32)
+        df["day"]       = day.astype(np.float32)
+        df["month"]     = month.astype(np.float32)
+
+        df["sin_dow"]   = np.sin(2 * np.pi * dow / 7.0).astype(np.float32)
+        df["cos_dow"]   = np.cos(2 * np.pi * dow / 7.0).astype(np.float32)
+        df["sin_month"] = np.sin(2 * np.pi * (month - 1) / 12.0).astype(np.float32)
+        df["cos_month"] = np.cos(2 * np.pi * (month - 1) / 12.0).astype(np.float32)
+        df["sin_day"]   = np.sin(2 * np.pi * (day - 1) / 31.0).astype(np.float32)
+        df["cos_day"]   = np.cos(2 * np.pi * (day - 1) / 31.0).astype(np.float32)
+    return df
 
 
 def _select_dynamic_cols(df: pd.DataFrame) -> List[str]:
@@ -286,8 +314,31 @@ def build_dataloaders(
     stores_df = pd.read_csv(RAW / "stores.csv")
     test_df   = pd.read_csv(RAW / "test.csv")
 
-    with open(PROC / "val_dates.json", "r") as f:
-        val_dates: List[str] = json.load(f)
+    train_df["date"] = pd.to_datetime(train_df["date"])
+    train_df["family"] = train_df["family"].astype(str)
+    test_df["family"]  = test_df["family"].astype(str)
+
+    # Chuẩn hoá cột log_sales và các cột thời gian cơ bản nếu chưa có
+    if "log_sales" not in train_df.columns:
+        if "sales_log1p" in train_df.columns:
+            train_df["log_sales"] = train_df["sales_log1p"].fillna(0.0).astype(np.float32)
+        elif "sales" in train_df.columns:
+            train_df["log_sales"] = np.log1p(train_df["sales"].clip(lower=0)).fillna(0.0).astype(np.float32)
+    else:
+        train_df["log_sales"] = train_df["log_sales"].fillna(0.0).astype(np.float32)
+
+    # Bổ sung các đặc trưng chu kỳ thời gian (sin/cos encoding)
+    train_df = _add_cyclic_features(train_df)
+
+    val_json_path = PROC / "val_dates.json"
+    if val_json_path.exists():
+        with open(val_json_path, "r") as f:
+            val_dates: List[str] = json.load(f)
+    elif "is_val" in train_df.columns:
+        val_dates = sorted(train_df.loc[train_df["is_val"] == 1, "date"].dt.strftime("%Y-%m-%d").unique().tolist())
+    else:
+        all_d = sorted(train_df["date"].dt.strftime("%Y-%m-%d").unique().tolist())
+        val_dates = all_d[-horizon:]
 
     # --- Bảng mã hoá ---
     cat_maps = _build_category_maps(train_df, stores_df)
@@ -297,13 +348,8 @@ def build_dataloaders(
     if "log_sales" not in test_df.columns:
         test_df["log_sales"] = 0.0
 
-    # Thêm cột thời gian cơ bản cho test_df nếu thiếu
-    if "dayofweek" not in test_df.columns:
-        test_df["dayofweek"] = test_df["date"].dt.dayofweek
-    if "day" not in test_df.columns:
-        test_df["day"]       = test_df["date"].dt.day
-    if "month" not in test_df.columns:
-        test_df["month"]     = test_df["date"].dt.month
+    # Bổ sung các đặc trưng chu kỳ thời gian (sin/cos encoding) cho test
+    test_df = _add_cyclic_features(test_df)
 
     dynamic_cols = _select_dynamic_cols(train_df)
 
@@ -345,21 +391,22 @@ def build_dataloaders(
     )
 
     # --- DataLoaders ---
+    use_pin = torch.cuda.is_available()
     train_ds = StoreSalesDataset(train_samples)
     val_ds   = StoreSalesDataset(val_samples)
     test_ds  = StoreSalesTestDataset(test_samples)
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True, drop_last=False,
+        num_workers=num_workers, pin_memory=use_pin, drop_last=False,
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
+        num_workers=num_workers, pin_memory=use_pin,
     )
     test_loader = DataLoader(
         test_ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
+        num_workers=num_workers, pin_memory=use_pin,
     )
 
     print(f"[Dataset] Train samples : {len(train_ds):,}")

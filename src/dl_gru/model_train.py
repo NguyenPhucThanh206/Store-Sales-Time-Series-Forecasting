@@ -25,7 +25,11 @@ import pathlib
 import time
 from typing import Dict, List, Optional, Tuple
 
+import matplotlib
+matplotlib.use("Agg")  # Chạy headless, không mở cửa sổ GUI
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from torch.optim import Adam
@@ -36,10 +40,13 @@ from torch.utils.data import DataLoader
 # 0.  ĐƯỜNG DẪN MẶC ĐỊNH
 # ──────────────────────────────────────────────────────────────
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+PROC      = ROOT / "data" / "processed"
 PRED_VAL  = ROOT / "predictions" / "val"
 PRED_TEST = ROOT / "predictions" / "test"
+FIGURES   = ROOT / "reports" / "figures"
 PRED_VAL.mkdir(parents=True, exist_ok=True)
 PRED_TEST.mkdir(parents=True, exist_ok=True)
+FIGURES.mkdir(parents=True, exist_ok=True)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -101,11 +108,13 @@ class GlobalMultiHorizonGRU(nn.Module):
             batch_first=True,
             dropout=dropout if n_gru_layers > 1 else 0.0,
         )
+        self.norm = nn.LayerNorm(hidden_dim)
 
-        # ----- Fully-Connected decoder head -----
+        # ----- Fully-Connected decoder head (với LayerNorm & Residual) -----
         fc_input = hidden_dim + emb_total
         self.fc = nn.Sequential(
             nn.Linear(fc_input, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, horizon),
@@ -119,15 +128,15 @@ class GlobalMultiHorizonGRU(nn.Module):
         cat_ids: torch.Tensor,     # (B, 3)   [store_idx, family_idx, cluster_idx]
     ) -> torch.Tensor:
         """
-        Forward pass.
+        Forward pass với Residual Skip Connection.
 
         Returns
         -------
         output : Tensor (B, H)  –  dự báo H=16 bước trên thang log1p.
         """
         # ----- GRU -----
-        gru_out, _ = self.gru(x_dynamic)       # (B, L, hidden_dim)
-        h_last = gru_out[:, -1, :]              # (B, hidden_dim)  – hidden cuối
+        gru_out, _ = self.gru(x_dynamic)              # (B, L, hidden_dim)
+        h_last = self.norm(gru_out[:, -1, :])         # (B, hidden_dim)
 
         # ----- Embedding -----
         e_store   = self.emb_store(cat_ids[:, 0])    # (B, emb_dim_store)
@@ -136,9 +145,15 @@ class GlobalMultiHorizonGRU(nn.Module):
 
         emb_cat = torch.cat([e_store, e_family, e_cluster], dim=1)  # (B, emb_total)
 
-        # ----- Concat & FC -----
+        # ----- Concat & FC Head -----
         combined = torch.cat([h_last, emb_cat], dim=1)              # (B, hidden+emb)
-        output   = self.fc(combined)                                 # (B, H)
+        delta    = self.fc(combined)                                 # (B, H)
+
+        # ----- Residual Skip Connection -----
+        # Cột 0 của x_dynamic chính là log_sales.
+        # Lấy mức trung bình quá khứ làm nền tảng, mạng chỉ cần học độ lệch (delta)
+        base_level = x_dynamic[:, :, 0].mean(dim=1, keepdim=True)    # (B, 1)
+        output = delta + base_level                                   # (B, H)
 
         return output
 
@@ -327,7 +342,73 @@ def predict(
 
 
 # ══════════════════════════════════════════════════════════════
-# 5.  SAVE / LOAD TRỌNG SỐ
+# 5.  HẬU XỬ LÝ (Post-processing) & VẼ ĐỒ THỊ
+# ══════════════════════════════════════════════════════════════
+def apply_postprocessing(
+    preds: np.ndarray,
+    zero_series_path: Optional[pathlib.Path] = None,
+) -> np.ndarray:
+    """
+    Hậu xử lý mảng dự báo:
+      1. Ép tất cả giá trị âm về 0.0 (doanh số không thể âm).
+      2. Nếu có zero_series.csv, ép các chuỗi toàn 0 (all_zero) về đúng 0.0.
+    """
+    # 1. Ép mọi giá trị âm về 0.0
+    preds = np.clip(preds, a_min=0.0, a_max=None)
+
+    # 2. Xử lý chuỗi toàn 0 nếu có file thông tin
+    if zero_series_path is not None and zero_series_path.exists():
+        try:
+            zero_df = pd.read_csv(zero_series_path)
+            if "series_id" in zero_df.columns and "kind" in zero_df.columns:
+                all_zero_ids = zero_df.loc[zero_df["kind"] == "all_zero", "series_id"].unique()
+                # Kiểm tra số chuỗi khớp kích thước (1782 chuỗi)
+                if len(preds) == 1782:
+                    valid_ids = [i for i in all_zero_ids if 0 <= i < 1782]
+                    preds[valid_ids, :] = 0.0
+                    print(f"  [Post-process] Đã ép {len(valid_ids)} chuỗi toàn 0 về 0.0")
+        except Exception as e:
+            print(f"  [Post-process] Cảnh báo khi đọc zero_series.csv: {e}")
+
+    return preds
+
+
+def plot_loss_curve(
+    history: Dict[str, List[float]],
+    save_path: pathlib.Path,
+) -> None:
+    """
+    Vẽ biểu đồ quá trình học tập (Train vs Val RMSLE) qua các Epoch và lưu ảnh.
+    Dùng để chèn vào Slide thuyết trình và Báo cáo nghiệm thu.
+    """
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    epochs = range(1, len(history["train_loss"]) + 1)
+    best_idx   = int(np.argmin(history["val_loss"]))
+    best_epoch = best_idx + 1
+    best_val   = history["val_loss"][best_idx]
+
+    plt.figure(figsize=(9, 5), dpi=150)
+    plt.plot(epochs, history["train_loss"], label="Train RMSLE", color="#1f77b4", lw=2)
+    plt.plot(epochs, history["val_loss"],   label="Validation RMSLE", color="#ff7f0e", lw=2)
+
+    # Đánh dấu Best Epoch
+    plt.axvline(x=best_epoch, color="red", linestyle="--", alpha=0.7,
+                label=f"Kỷ lục Epoch {best_epoch} (RMSLE = {best_val:.5f})")
+    plt.scatter([best_epoch], [best_val], color="red", s=70, zorder=5)
+
+    plt.title("Quá trình huấn luyện mạng Global Multi-Horizon GRU", fontsize=13, fontweight="bold")
+    plt.xlabel("Epoch", fontsize=11)
+    plt.ylabel("RMSLE (trên thang log1p)", fontsize=11)
+    plt.grid(True, linestyle=":", alpha=0.6)
+    plt.legend(fontsize=10)
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+    print(f"  [Plot] Biểu đồ Loss Curve đã được lưu → {save_path}")
+
+
+# ══════════════════════════════════════════════════════════════
+# 6.  SAVE / LOAD TRỌNG SỐ
 # ══════════════════════════════════════════════════════════════
 def save_checkpoint(
     model: GlobalMultiHorizonGRU,
@@ -394,7 +475,7 @@ def run_full_pipeline(
     test_preds     : ndarray (N_test, 16) trên thang log1p
     """
     # Import dataset builder (cùng package)
-    from src.dl_gru.dataset import build_dataloaders
+    from dataset import build_dataloaders
 
     print("=" * 70)
     print("  GLOBAL MULTI-HORIZON GRU – PIPELINE")
@@ -451,10 +532,20 @@ def run_full_pipeline(
 
     best_val_rmsle = min(history["val_loss"])
 
-    # ---- 4. Predict ----
-    print("\n── 4. Sinh dự báo ──")
+    # Vẽ và lưu biểu đồ Loss Curve phục vụ Báo cáo & Slide
+    loss_curve_path = FIGURES / "gru_loss_curve.png"
+    plot_loss_curve(history, loss_curve_path)
+
+    # ---- 4. Predict & Hậu xử lý ----
+    print("\n── 4. Sinh dự báo & Hậu xử lý ──")
     val_preds  = predict(model, val_loader, device)    # (N_val, 16)
     test_preds = predict(model, test_loader, device)   # (N_test, 16)
+
+    # Áp dụng hậu xử lý (ép số âm về 0 & xử lý chuỗi toàn 0)
+    zero_path  = PROC / "zero_series.csv"
+    val_preds  = apply_postprocessing(val_preds, zero_path)
+    test_preds = apply_postprocessing(test_preds, zero_path)
+
     print(f"  Val  predictions shape: {val_preds.shape}")
     print(f"  Test predictions shape: {test_preds.shape}")
 

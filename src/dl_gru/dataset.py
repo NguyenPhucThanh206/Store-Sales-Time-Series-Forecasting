@@ -97,7 +97,7 @@ def _add_cyclic_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     if "date" in df.columns:
         dt = pd.to_datetime(df["date"])
-        dow   = dt.dt.dayofweek
+        dow   = dt.dt.day_of_week
         day   = dt.dt.day
         month = dt.dt.month
 
@@ -130,6 +130,7 @@ def _prepare_series(
     horizon: int = 16,
     mode: str = "train",          # "train" | "val" | "test"
     val_dates: Optional[List[str]] = None,
+    test_start: Optional[pd.Timestamp] = None,
 ) -> List[Dict[str, np.ndarray]]:
     """
     Tạo danh sách các mẫu (sample) từ DataFrame.
@@ -142,9 +143,9 @@ def _prepare_series(
       • cluster_idx: int   – chỉ số embedding cluster
 
     Quy tắc:
-      - mode="train" : lấy TẤT CẢ cửa sổ trượt hợp lệ, loại trừ ngày val.
+      - mode="train" : lấy cửa sổ có toàn bộ target trước ngày val.
       - mode="val"   : chỉ lấy 1 cửa sổ cuối sao cho target = val_dates.
-      - mode="test"  : lấy 1 cửa sổ cuối cùng (không có target, y_target=0).
+      - mode="test"  : lấy lookback ngày trước test_start; chuỗi không có lịch sử được pad 0.
     """
     store_cluster = _store_to_cluster(stores_df)
     dynamic_cols  = _select_dynamic_cols(df)
@@ -173,14 +174,17 @@ def _prepare_series(
         T = len(grp)
 
         if mode == "test":
-            # Chỉ lấy lookback ngày cuối cùng (không có target)
-            if T < lookback:
-                # Pad nếu chuỗi quá ngắn
-                pad_len = lookback - T
-                dyn_pad = np.zeros((pad_len, dyn.shape[1]), dtype=np.float32)
-                x_dyn   = np.concatenate([dyn_pad, dyn], axis=0)
+            if test_start is None:
+                raise ValueError("test_start phải được cung cấp cho mode='test'")
+            # test.csv chỉ xác định các chuỗi cần dự báo; không được đưa ngày test vào input.
+            history = dyn[dates < np.datetime64(test_start)]
+            if len(history) < lookback:
+                pad_len = lookback - len(history)
+                x_dyn = np.concatenate(
+                    [np.zeros((pad_len, dyn.shape[1]), dtype=np.float32), history], axis=0
+                )
             else:
-                x_dyn = dyn[-lookback:]
+                x_dyn = history[-lookback:]
             samples.append({
                 "x_dynamic"  : x_dyn,
                 "y_target"   : np.zeros(horizon, dtype=np.float32),
@@ -201,12 +205,20 @@ def _prepare_series(
             if len(idx_val) == 0:
                 continue  # chuỗi này không có ngày val
             t_val = idx_val[0]
-            if t_val < lookback:
-                continue  # không đủ lookback
-            x_dyn    = dyn[t_val - lookback : t_val]
+            history = dyn[max(0, t_val - lookback) : t_val]
+            if len(history) < lookback:
+                x_dyn = np.concatenate(
+                    [np.zeros((lookback - len(history), dyn.shape[1]), dtype=np.float32),
+                     history], axis=0
+                )
+            else:
+                x_dyn = history
             y_target = dyn[t_val : t_val + horizon, 0]  # cột 0 = log_sales
             if len(y_target) < horizon:
                 continue
+            if not np.array_equal(dates[t_val : t_val + horizon],
+                                  pd.to_datetime(val_dates).to_numpy()):
+                raise ValueError("Ngày target của chuỗi không khớp val_dates")
             samples.append({
                 "x_dynamic"  : x_dyn,
                 "y_target"   : y_target,
@@ -223,8 +235,8 @@ def _prepare_series(
             val_start = None
 
         for t in range(lookback, T - horizon + 1):
-            # Loại trừ cửa sổ chồng lên val
-            if val_start is not None and pd.Timestamp(dates[t]) >= val_start:
+            # Cả 16 nhãn phải nằm trước validation, không chỉ nhãn đầu tiên.
+            if val_start is not None and pd.Timestamp(dates[t + horizon - 1]) >= val_start:
                 break
 
             x_dyn    = dyn[t - lookback : t]
@@ -353,8 +365,13 @@ def build_dataloaders(
 
     dynamic_cols = _select_dynamic_cols(train_df)
 
-    # ---- Ghép test_df vào cuối train_df để tạo cửa sổ lookback cho test ----
-    # Lấy lookback ngày cuối của mỗi chuỗi từ train_df, nối với test_df
+    # Test có đủ mọi chuỗi, kể cả các chuỗi toàn 0 không có trong train_clean.
+    # Lịch sử dùng làm input phải kết thúc trước ngày test đầu tiên.
+    test_start = test_df["date"].min()
+    if test_df.groupby(["store_nbr", "family"]).size().ne(horizon).any():
+        raise ValueError("Mỗi chuỗi test phải có đúng horizon ngày")
+    # Lấy lookback ngày cuối của mỗi chuỗi từ train_df, nối với test_df để
+    # _prepare_series nhìn thấy cả những chuỗi không có lịch sử.
     train_df["date"] = pd.to_datetime(train_df["date"])
     tail_parts = []
     for (store, family), grp in train_df.groupby(["store_nbr", "family"]):
@@ -387,8 +404,10 @@ def build_dataloaders(
     test_samples = _prepare_series(
         combined_test, stores_df, cat_maps,
         lookback=lookback, horizon=horizon,
-        mode="test",
+        mode="test", test_start=test_start,
     )
+    if len(test_samples) != test_df[["store_nbr", "family"]].drop_duplicates().shape[0]:
+        raise AssertionError("Số chuỗi test sau khi tạo cửa sổ không khớp test.csv")
 
     # --- DataLoaders ---
     use_pin = torch.cuda.is_available()

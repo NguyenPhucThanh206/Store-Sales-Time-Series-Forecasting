@@ -19,6 +19,7 @@
 *.ckpt
 *.cbm
 *.model
+*.ubj
 *.txt.model
 catboost_info/
 

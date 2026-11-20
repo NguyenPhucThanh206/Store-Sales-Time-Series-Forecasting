@@ -19,8 +19,10 @@
 *.ckpt
 *.cbm
 *.model
+*.ubj
 *.txt.model
 catboost_info/
+predictions/experiments/
 
 # ==========================================
 # 2. PYTHON & MÔI TRƯỜNG ẢO (VIRTUAL ENV)

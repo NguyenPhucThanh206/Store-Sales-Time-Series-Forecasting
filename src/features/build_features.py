@@ -21,6 +21,10 @@ Bộ Feature Engineering dùng chung cho nhánh Non-DL (LightGBM / CatBoost / XG
         from src.features.build_features import load_fe, FEATURES, CAT_FEATURES, TARGET
         train_fe, test_fe = load_fe()
 
+BASE_FEATURES giữ 38 đặc trưng T05 gốc. FEATURES bổ sung các nhóm trong
+guided_features.FEATURE_GROUPS; check_no_leakage kiểm tra cả hai bộ. Các
+đặc trưng giao dịch dùng transactions.csv tại thời điểm t-16 hoặc sớm hơn.
+
 Quy ước thứ tự dòng (bàn giao cho T06-T08, T13):
     * Dự báo test (.npy, thang log1p) lưu THEO THỨ TỰ DÒNG CỦA test_fe = (series_id, date), tức
       1.782 chuỗi x 16 ngày (reshape được thành (1782, 16), cùng thứ tự với GRU).
@@ -51,6 +55,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .guided_features import GUIDED_FEATURES, add_guided_features
+
 ROOT = Path(__file__).resolve().parents[2]
 RAW_DIR = ROOT / "data" / "raw"
 PROC_DIR = ROOT / "data" / "processed"
@@ -68,7 +74,7 @@ HOLIDAY_FEATURES = [
     "hol_national", "hol_regional", "hol_local", "is_holiday", "is_bridge", "is_additional",
     "is_workday", "is_event", "is_earthquake", "is_shopping_event", "is_sport_event",
 ]
-FEATURES = [
+BASE_FEATURES = [
     *CAT_FEATURES,
     # thời gian & ngày lương
     "dayofweek", "day_of_month", "month", "dayofyear", "is_payday", "days_since_payday",
@@ -83,6 +89,7 @@ FEATURES = [
     *(f"rolling_mean_{w}" for w in ROLL_WINDOWS),
     "rolling_std_28",
 ]
+FEATURES = [*BASE_FEATURES, *GUIDED_FEATURES]
 
 
 # ------------------------------------------------------------------ load inputs
@@ -98,6 +105,7 @@ def load_inputs(raw_dir: Path, proc_dir: Path) -> dict:
         "oil": pd.read_parquet(proc_dir / "oil_clean.parquet"),
         "cal": pd.read_parquet(proc_dir / "holidays_store.parquet"),
         "stores": pd.read_csv(raw_dir / "stores.csv"),
+        "transactions": pd.read_csv(raw_dir / "transactions.csv"),
         "zero": (pd.read_csv(proc_dir / "zero_series.csv") if (proc_dir / "zero_series.csv").exists()
                  else None),
     }
@@ -212,12 +220,13 @@ def to_categorical(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build(full: pd.DataFrame, stores, oil, cal) -> pd.DataFrame:
+def build(full: pd.DataFrame, stores, oil, cal, transactions) -> pd.DataFrame:
     df = add_calendar(full.copy())
     df = add_external(df, stores, oil, cal)
     df = add_promo(df)
     df = add_sales_lags(df)
     df = to_categorical(df)
+    df = add_guided_features(df, transactions)
     return df.sort_values(["series_id", "date"]).reset_index(drop=True)
 
 
@@ -253,14 +262,14 @@ def apply_zero_series(pred_log1p: np.ndarray, test_fe: pd.DataFrame) -> np.ndarr
 
 
 # ------------------------------------------------------------------- checks
-def check_no_leakage(full, stores, oil, cal, built) -> None:
+def check_no_leakage(full, stores, oil, cal, transactions, built) -> None:
     """Xoá doanh số 16 ngày Validation rồi dựng lại: đặc trưng các dòng Validation phải y hệt.
 
     Xoá cả `sales` gốc lẫn `sales_log1p` để bắt được cả đặc trưng sau này tính từ `sales`.
     """
     masked = full.copy()
     masked.loc[masked["is_val"] == 1, ["sales", TARGET]] = np.nan
-    rebuilt = build(masked, stores, oil, cal)
+    rebuilt = build(masked, stores, oil, cal, transactions)
     val = built["is_val"] == 1
     a = built.loc[val, FEATURES].reset_index(drop=True)
     b = rebuilt.loc[val, FEATURES].reset_index(drop=True)
@@ -302,11 +311,11 @@ def run(raw_dir=RAW_DIR, proc_dir=PROC_DIR, check=True):
     raw_dir, proc_dir = Path(raw_dir), Path(proc_dir)
     inp = load_inputs(raw_dir, proc_dir)
     full = stack_train_test(inp["train"], inp["test"])
-    df = build(full, inp["stores"], inp["oil"], inp["cal"])
+    df = build(full, inp["stores"], inp["oil"], inp["cal"], inp["transactions"])
 
     if check:
         check_lag_alignment(df)
-        check_no_leakage(full, inp["stores"], inp["oil"], inp["cal"], df)
+        check_no_leakage(full, inp["stores"], inp["oil"], inp["cal"], inp["transactions"], df)
         print("checks          : lag/rolling khớp theo ngày (train + test), "
               "không rò rỉ doanh số Validation -> OK")
 
@@ -322,7 +331,7 @@ def run(raw_dir=RAW_DIR, proc_dir=PROC_DIR, check=True):
     assert len(train_fe) == len(inp["train"]) and len(test_fe) == len(inp["test"])
     assert set(test_fe["id"]) == set(inp["test"]["id"])
     assert not train_fe["series_id"].isin(zero_ids).any(), "Chuỗi toàn 0 lọt vào train"
-    assert test_fe[[c for c in FEATURES if not c.startswith(("sales_", "rolling_"))]
+    assert test_fe[[c for c in BASE_FEATURES if not c.startswith(("sales_", "rolling_"))]
                    ].notna().all().all(), "Đặc trưng không phải doanh số có NaN ở test"
     for c in CAT_FEATURES:
         assert isinstance(train_fe[c].dtype, pd.CategoricalDtype)

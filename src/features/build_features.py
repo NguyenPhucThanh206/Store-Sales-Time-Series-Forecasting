@@ -235,20 +235,33 @@ def align_categories(train: pd.DataFrame, test: pd.DataFrame) -> None:
     for c in CAT_FEATURES:
         cats = pd.Index(np.union1d(train[c].astype(object).dropna().unique(),
                                    test[c].astype(object).dropna().unique()))
+        if pd.api.types.is_integer_dtype(cats.infer_objects()):
+            cats = cats.astype("int64")  # store_nbr / cluster: danh mục số (XGBoost từ chối object)
         for d in (train, test):
             d[c] = pd.Categorical(d[c].astype(object), categories=cats)
 
 
 def load_fe(proc_dir=PROC_DIR, columns=None):
-    """Đọc (train_fe, test_fe) và khôi phục dtype `category` cho CAT_FEATURES."""
+    """Đọc (train_fe, test_fe) và khôi phục dtype `category` cho CAT_FEATURES.
+
+    `columns`: chỉ đọc các cột này (+ CAT_FEATURES); cột không có trong một file (vd `id`,
+    `is_zero_series` chỉ có ở test, `sales_log1p` chỉ có ở train) được bỏ qua với file đó.
+    """
+    import pyarrow.parquet as pq
+
     proc_dir = Path(proc_dir)
-    cols_tr = cols_te = None
+    paths = {"train": proc_dir / "train_fe.parquet", "test": proc_dir / "test_fe.parquet"}
+    cols = {k: None for k in paths}
     if columns is not None:
         keep = list(dict.fromkeys([*columns, *CAT_FEATURES]))
-        cols_tr = [c for c in keep if c != "id"]
-        cols_te = [c for c in keep if c not in ("sales", TARGET, "is_val", "is_closed")]
-    train = pd.read_parquet(proc_dir / "train_fe.parquet", columns=cols_tr)
-    test = pd.read_parquet(proc_dir / "test_fe.parquet", columns=cols_te)
+        for k, p in paths.items():
+            have = set(pq.read_schema(p).names)
+            cols[k] = [c for c in keep if c in have]
+        unknown = set(keep) - set(cols["train"]) - set(cols["test"])
+        if unknown:
+            raise KeyError(f"Không có cột {sorted(unknown)} trong train_fe / test_fe")
+    train = pd.read_parquet(paths["train"], columns=cols["train"])
+    test = pd.read_parquet(paths["test"], columns=cols["test"])
     align_categories(train, test)
     return train, test
 

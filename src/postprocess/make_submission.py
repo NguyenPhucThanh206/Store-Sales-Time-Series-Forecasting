@@ -27,6 +27,8 @@ RAW_DIR = ROOT / "data" / "raw"
 
 def build_submission(pred_log, test_clean, zero_info, sample, zero_tail=True) -> pd.DataFrame:
     pred_log = np.asarray(pred_log, dtype="float64")
+    if pred_log.ndim == 2 and pred_log.size == len(test_clean):
+        pred_log = pred_log.reshape(-1)
     if pred_log.shape != (len(test_clean),):
         raise ValueError(f"Dự đoán có shape {pred_log.shape}, test_clean có {len(test_clean)} dòng. "
                          "Thứ tự phải theo test_clean (sắp theo series_id, date).")
@@ -69,8 +71,16 @@ def run(pred_path, out_path, proc_dir=PROC_DIR, raw_dir=RAW_DIR, zero_tail=True)
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--pred", required=True, help="File .npy dự đoán test (thang log1p)")
-    p.add_argument("--out", required=True, help="File CSV đầu ra, vd submissions/submission_w1.csv")
+    # Đặt giá trị mặc định để bấm nút Run trong VS Code vẫn chạy được bình thường
+    default_pred = PRED_DIR = ROOT / "predictions" / "test" / "test_pred_blend.npy"
+    if not default_pred.exists():
+        default_pred = ROOT / "predictions" / "test" / "test_pred_gru.npy"
+    default_out = ROOT / "submissions" / "submission_final.csv"
+
+    p.add_argument("--pred", default=str(default_pred),
+                   help="File .npy dự đoán test (thang log1p). Mặc định: test_pred_blend.npy")
+    p.add_argument("--out", default=str(default_out),
+                   help="File CSV đầu ra. Mặc định: submissions/submission_final.csv")
     p.add_argument("--no-zero-tail", action="store_true",
                    help="Chỉ ép 0 cho chuỗi toàn 0, không ép chuỗi 0 ở 28 ngày cuối")
     a = p.parse_args()

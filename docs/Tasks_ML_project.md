@@ -71,12 +71,19 @@ Hệ thống được thiết kế theo mô hình **2 nhánh song song** trên c
    * **LightGBM:** Tận dụng tốc độ huấn luyện nhanh theo chiến lược *leaf-wise* để làm mô hình cơ sở (Baseline) và đánh giá độ hiệu quả của từng nhóm đặc trưng.
    * **CatBoost:** Tận dụng cơ chế cây đối xứng (*oblivious trees*) và mã hóa trực tiếp các biến phân loại định danh (`store_nbr`, `family`, `city`, `cluster`) qua tham số `cat_features`.
    * **XGBoost:** Sử dụng thuật toán xấp xỉ histogram (`tree_method='hist'`, `enable_categorical=True`) theo chiến lược *depth-wise* để tạo sự đa dạng cấu trúc cây khi kết hợp.
-2. **Nhánh 2 (DL-based – Global Multi-Horizon GRU):**
-   * Mô hình mạng nơ-ron hồi quy **GRU** học toàn cục trên toàn bộ 1.782 chuỗi.
-   * Sử dụng các lớp `Embedding` để biểu diễn thông tin tĩnh (`store_nbr`, `family`, `cluster`), kết hợp với chuỗi đặc trưng động trong cửa sổ trượt $L = 30$ ngày quá khứ và xuất trực tiếp vector dự báo **16 ngày** qua lớp Linear cuối cùng (tránh sai số tích lũy).
+2. **Nhánh 2 (DL-based – Global Multi-Horizon GRU có Residual Skip & Cyclic Encoding):**
+   * Mô hình mạng nơ-ron hồi quy **GRU** học toàn cục (Global) trên toàn bộ 1.782 chuỗi.
+   * **Đặc trưng chu kỳ thời gian (Cyclic Time Encoding):** Bổ sung 6 đặc trưng sóng hàm $\sin/\cos$ cho `dayofweek`, `day`, `month` vào chuỗi 30 ngày (nâng tổng số đặc trưng động lên 11), giúp mạng bắt nhịp mượt mà tính mùa vụ tuần/tháng.
+   * **Kiến trúc & Tầng ẩn:** GRU 2 lớp (`hidden_dim=128`, `dropout=0.2`) kết hợp lớp `LayerNorm` để ổn định phân phối gradient, hòa trộn cùng 3 tầng `Embedding` thông tin tĩnh (`store_nbr`: 8 chiều, `family`: 8 chiều, `cluster`: 4 chiều $\rightarrow$ vector tĩnh 20 chiều).
+   * **Cơ chế Học phần dư (Residual Skip Connection):** Lấy mức trung bình doanh số 30 ngày quá khứ ($\bar{x}_{\text{past}}$) làm mức nền tảng; mạng chỉ học phần dư biến động ($\Delta$), xuất trực tiếp vector dự báo **16 ngày** qua lớp Fully-Connected cuối cùng để triệt tiêu hoàn toàn sai số tích lũy.
+   * **Hiệu năng thực tế:** Huấn luyện trên GPU RTX 4050 chỉ mất ~45s/epoch; đạt điểm cục bộ **Val RMSLE = 0.43054** và điểm **Public Leaderboard Kaggle = 0.40446** (mô hình đơn lẻ dẫn đầu toàn đội).
 
 ### 2.3. Chiến lược Kết hợp (Ensembling) và Giải thích Mô hình (XAI)
-* **Blending 2 tầng:** Tìm trọng số tối ưu trên tập Validation để trộn 3 mô hình nhánh Non-DL ($\hat{z}_{\text{Non-DL}}$), sau đó kết hợp với nhánh Deep Learning ($\hat{z}_{\text{GRU}}$) trước khi biến đổi ngược $\exp(\hat{z}) - 1$. Áp dụng hậu xử lý ép doanh số ngày 1/1 về `0`.
+* **Blending 2 tầng (Hierarchical Blending) với SciPy Optimize:**
+  * *Tầng 1 (Khối Non-DL):* Hòa trộn 3 mô hình cây (LightGBM, CatBoost, XGBoost) để trung hòa sai số cấu trúc cây riêng lẻ $\rightarrow \hat{z}_{\text{Tree}}$.
+  * *Tầng 2 (Khối Tổng hợp):* Sử dụng `scipy.optimize.minimize` (thuật toán SLSQP) với ràng buộc $\sum w_i = 1, w_i \ge 0$ để tối ưu hóa trọng số; đặc biệt đặt tỷ trọng cho **GRU làm chủ lực ($\ge 50\%$)** nhằm khắc phục triệt để hiện tượng **Validation Overfitting** của các mô hình cây (khi cây đạt điểm ảo trên tập Val do biến lag nhưng bị suy giảm trên tập test thực tế).
+  * *Kết quả tổ hợp:* Đạt **RMSLE Validation = 0.38897** (phá vỡ mốc 0.39, cải thiện 1.5% so với mô hình đơn lẻ tốt nhất).
+* **Hậu xử lý (Post-processing):** Áp dụng `np.clip(a_min=0)` triệt tiêu số âm, tra cứu `zero_series.csv` ép thẳng 114 chuỗi không bán hàng (`all_zero` và `zero_last_28d`) về đúng `0.0`, ép doanh số ngày 1/1 về `0`.
 * **XAI (Explainable AI):** Sử dụng `shap.TreeExplainer` trên mô hình tốt nhất của nhánh Non-DL để xuất biểu đồ **Summary Plot** (đánh giá mức độ đóng góp toàn cục của đặc trưng) và **Waterfall Plot** (giải thích cục bộ biến động doanh số trong dịp lễ/ngày lương).
 
 ---
@@ -107,16 +114,16 @@ Quy ước: **1 ngày công $\approx$ 3–4 giờ làm việc tập trung**. Tu�
 | **T01** | Khởi tạo nhóm Kaggle & Repo GitHub | Lập team `UET_[INT3405E_5]_[STT]`, cấu trúc thư mục, quy ước nhánh code | 1,0 | **Thành** | Tuần 1 (N1) | Tuần 1 (80%) |
 | **T02** | Khung tiền xử lý & Chia tập Validation | Đọc 6 file CSV, biến đổi `log1p(sales)`, cắt chuỗi 0 đầu kỳ, tách 16 ngày cuối làm Validation | 2,0 | **Thành** | Tuần 1 (N1–N2) | Tuần 1 (80%) |
 | **T03** | EDA & Xử lý dữ liệu ngoại sinh | Nội suy `oil.csv`, lọc `Transferred` và khớp địa lý `holidays_events.csv` | 2,0 | **Trí** | Tuần 1 (N1–N2) | Tuần 1 (80%) |
-| **T04** | Pipeline Dataset & Embedding cho GRU | Xây dựng bộ dữ liệu cửa sổ trượt 30 ngày $\rightarrow$ 16 ngày, tầng Embedding cho `store_nbr`, `family` | 2,5 | **Lợi** | Tuần 1 (N1–N3) | Tuần 1 (80%) |
+| **T04** | Pipeline Dataset & Embedding cho GRU | Xây dựng bộ dữ liệu cửa sổ trượt 30 ngày $\rightarrow$ 16 ngày, tầng Embedding (`store`, `family`, `cluster`), bổ sung mã hóa chu kỳ thời gian Sin/Cos (11 dynamic features) | 2,5 | **Lợi** | Tuần 1 (N1–N3) | Tuần 1 (80%) |
 | **T05** | Bộ Feature Engineering dùng chung | Tạo `is_payday`, `days_to_holiday`, `lag_16/21/28/364`, `rolling_mean`, xuất file `.parquet` | 3,0 | **Trí** | Tuần 1 (N3–N4) | Tuần 1 (80%) |
 | **T06** | Huấn luyện mô hình LightGBM (Baseline & Full) | Chạy LightGBM trên dữ liệu sạch, đo RMSLE Validation, lưu mảng dự báo `.npy` | 2,5 | **Thành** | Tuần 1 (N3–N5) | Tuần 1 (80%) |
 | **T07** | Huấn luyện mô hình XGBoost | Cấu hình `hist` & `enable_categorical`, huấn luyện trên tập `.parquet`, lưu dự báo `.npy` | 3,0 | **Kiên** | Tuần 1 (N4–N6) | Tuần 1 (80%) |
 | **T08** | Huấn luyện mô hình CatBoost | Cấu hình `cat_features`, huấn luyện trên tập `.parquet`, lưu dự báo `.npy` | 2,5 | **Trí** | Tuần 1 (N5–N6) | Tuần 1 (80%) |
-| **T09** | Dựng & Huấn luyện mạng GRU hoàn chỉnh | Huấn luyện mô hình Global GRU trên GPU (Kaggle/Colab), xuất dự báo Validation & Test `.npy` | 3,5 | **Lợi** | Tuần 1 (N4–N7) | Tuần 1 (80%) |
-| **T10** | **Xuất file `submission.csv` nộp Kaggle lần 1** | Hậu xử lý (`expm1`, ép ngày 1/1 về 0), nộp kết quả lên Kaggle lấy điểm mốc Public LB | 1,0 | **Thành** | Tuần 1 (N6–N7) | **Chốt mốc 80%** |
-| **T11** | Tinh chỉnh siêu tham số nhánh Non-DL | Chọn lọc đặc trưng quan trọng, tinh chỉnh `learning_rate`, `num_leaves`, `max_depth` | 1,5 | **Thành, Trí, Kiên** | Tuần 2 (N8–N10) | Tuần 2 (20%) |
+| **T09** | Dựng & Huấn luyện mạng GRU hoàn chỉnh | Huấn luyện Global GRU (Residual Skip + LayerNorm) trên GPU (~45s/epoch), xuất Loss Curve và dự báo `.npy` đạt RMSLE Val 0.4305, Test Kaggle 0.4044 | 3,5 | **Lợi** | Tuần 1 (N4–N7) | Tuần 1 (80%) |
+| **T10** | **Xuất file `submission.csv` nộp Kaggle lần 1** | Hậu xử lý (`expm1`, ép chuỗi `all_zero` và ngày 1/1 về 0), nộp kết quả lên Kaggle lấy điểm mốc Public LB | 1,0 | **Thành** | Tuần 1 (N6–N7) | **Chốt mốc 80%** |
+| **T11** | Tinh chỉnh siêu tham số nhánh Non-DL | Khắc phục hiện tượng học vẹt (Validation Overfit): giảm `num_leaves` (127 $\rightarrow$ 31/63), tăng `min_child_samples` (50–100), siết chặt phạt L1/L2 và subsampling (0.7) | 1,5 | **Thành, Trí, Kiên** | Tuần 2 (N8–N10) | Tuần 2 (20%) |
 | **T12** | Tinh chỉnh nhẹ kiến trúc GRU | Thử nghiệm Dropout, kích thước lớp ẩn hoặc lịch giảm learning rate để giảm lỗi Validation | 1,5 | **Lợi** | Tuần 2 (N8–N10) | Tuần 2 (20%) |
-| **T13** | Chạy Ensembling (Blending 2 nhánh) | Phân tích tương quan lỗi, tìm trọng số tối ưu kết hợp `LGBM + CatBoost + XGBoost` và `GRU` | 1,5 | **Kiên, Trí** | Tuần 2 (N11–N12) | Tuần 2 (20%) |
+| **T13** | Chạy Ensembling (Blending 2 nhánh) | Áp dụng Blending 2 tầng (Hierarchical Blending) với SciPy Optimize (SLSQP), cân bằng trọng số giữa khối Non-DL và GRU chủ lực, đạt RMSLE 0.3889 | 1,5 | **Kiên, Trí** | Tuần 2 (N11–N12) | Tuần 2 (20%) |
 | **T14** | Triển khai XAI (SHAP) & Phân tích lỗi | Chạy `TreeExplainer`, xuất Summary Plot, Waterfall Plot, phân tích sai số dư theo nhóm | 2,0 | **Kiên** | Tuần 2 (N10–N13) | Tuần 2 (20%) |
 | **T15** | Nộp bản cuối Kaggle & Đóng băng mã nguồn | Nộp file `submission.csv` đạt điểm cao nhất, kiểm tra tính tái lập của toàn bộ notebook | 1,0 | **Thành** | Tuần 2 (N13–N14) | **Chốt mốc 100% code** |
 | **T16** | Soạn thảo nội dung Slide & Báo cáo | Viết nội dung: Tổng quan/Kết quả (Thành: 0.5), FE/CatBoost (Trí: 0.3), GRU (Lợi: 1.0), XGBoost/XAI/Blending (Kiên: 1.2) | 3,0 | **Cả nhóm** | Tuần 3 (N15–N18) | Tuần 3 (Báo cáo) |
@@ -173,3 +180,4 @@ Quy ước: **1 ngày công $\approx$ 3–4 giờ làm việc tập trung**. Tu�
 **Phương án dự phòng rủi ro:**
 * **Rủi ro trễ dữ liệu Feature Engineering (Ngày 4):** Nếu bộ đặc trưng nâng cao của Trí chưa hoàn thiện kịp Ngày 4, Thành và Kiên vẫn tiến hành huấn luyện LightGBM và XGBoost trên bộ dữ liệu cơ bản từ Ngày 2 (`train_clean.parquet`) để đảm bảo chắc chắn có tệp `submission.csv` nộp lên Kaggle đúng hạn Ngày 7, sau đó cập nhật đặc trưng mới ở đầu Tuần 2.
 * **Rủi ro thiếu tài nguyên GPU khi huấn luyện GRU:** Lợi chủ động sử dụng song song tài nguyên GPU miễn phí của Kaggle (30 giờ/tuần) và Google Colab; trong trường hợp mạng GRU hội tụ chậm, ưu tiên sử dụng kiến trúc GRU 1–2 lớp với kích thước ẩn vừa phải (64–128) và dùng `EarlyStopping` để đảm bảo hoàn thành đúng mốc Ngày 7.
+* **Rủi ro nhánh Non-DL bị Overfitting trên tập Validation (Tuần 2):** Các mô hình cây GBDT có xu hướng học vẹt (quá khớp) trên 16 ngày Validation do phụ thuộc các biến trễ ngắn (`sales_lag_16`), khiến việc tối ưu trọng số phẳng bằng SciPy làm suy giảm điểm trên tập Test thực tế. Nhóm xử lý bằng 2 biện pháp phối hợp: (1) Siết chặt Regularization ở Task T11 (hạ `num_leaves` xuống 31/63, tăng `min_child_samples` lên 50–100, đặt `colsample_bytree = 0.7`); (2) Áp dụng chiến lược **Blending 2 tầng** với mạng GRU (mô hình khái quát hóa tốt nhất trên Test) giữ vai trò chủ lực ($\ge 50\%$) trong tệp nộp cuối cùng.
